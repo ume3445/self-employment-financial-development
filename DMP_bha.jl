@@ -356,12 +356,17 @@ function solve_worker_savings(theta::Float64, v_pol::Matrix{Float64}, p::Params;
         W_new = similar(W)
         U_new = similar(U)
 
-        # Wbar(a) on the asset grid: vacancy-weighted W over firm states
+        # Wbar(a) on the asset grid: vacancy-weighted value a job seeker expects.
+        # ACCEPTANCE / PARTICIPATION CONSTRAINT: a worker only accepts an offer
+        # if employment beats staying unemployed, so the relevant value at each
+        # firm state is max(W(a,z,ell), U(a)), not W itself. A worker offered a
+        # job worse than unemployment rejects it and keeps U(a). By construction
+        # this rules out accepted jobs with W < U.
         Wbar = zeros(p.n_a)
         for ia in 1:p.n_a
             acc = 0.0
             for iz in 1:p.n_z, il in 1:p.n_ell
-                acc += Vw[iz, il] * W[ia, iz, il]
+                acc += Vw[iz, il] * max(W[ia, iz, il], U[ia])
             end
             Wbar[ia] = acc
         end
@@ -452,7 +457,8 @@ function draw_next_z(p::Params, iz::Int)
 end
 
 function simulate_distribution(theta::Float64, v_pol::Matrix{Float64},
-                               apW::Array{Float64,3}, apU::Vector{Float64}, p::Params;
+                               apW::Array{Float64,3}, apU::Vector{Float64},
+                               W::Array{Float64,3}, U::Vector{Float64}, p::Params;
                                N=20_000, T=1_000, seed=1234)
     Random.seed!(seed)
     qt    = q_theta(theta, p)
@@ -489,16 +495,23 @@ function simulate_distribution(theta::Float64, v_pol::Matrix{Float64},
             else
                 a[n] = interp_a(apU, p, a[n])
                 if rand() < ft
-                    emp[n] = true
                     iz, il = draw_firm()
-                    fz[n] = iz; fl[n] = il
+                    # Acceptance constraint: take the job only if it beats
+                    # staying unemployed at current assets (W >= U).
+                    W_offer = interp_W(W, p, a[n], iz, p.ell_grid[il])
+                    U_stay  = interp_a(U, p, a[n])
+                    if W_offer >= U_stay
+                        emp[n] = true
+                        fz[n] = iz; fl[n] = il
+                    end
                 end
             end
         end
     end
 
     assets = copy(a)
-    return (assets=assets, u_rate=count(!, emp)/N, K_agg=mean(assets), emp=emp)
+    return (assets=assets, u_rate=count(!, emp)/N, K_agg=mean(assets),
+            emp=emp, fz=fz, fl=fl)
 end
 
 
@@ -537,7 +550,7 @@ function solve_equilibrium(p::Params; theta_lo=0.05, theta_hi=8.0, ell_entry=1.0
     W, U, apW, apU = solve_worker_savings(theta_star, v_pol, p; verbose=true)
 
     println("\n[3/3] Simulating stationary wealth distribution ...")
-    sim = simulate_distribution(theta_star, v_pol, apW, apU, p)
+    sim = simulate_distribution(theta_star, v_pol, apW, apU, W, U, p)
 
     return Equilibrium(theta_star, E, v_pol, W, U, apW, apU, sim, p)
 end
@@ -546,6 +559,20 @@ end
 # =============================================================================
 # SECTION 12: Report
 # =============================================================================
+
+# Representative employed worker's firm state: the MEDIAN (z, ell) among
+# employed workers in the simulated stationary distribution. This avoids
+# picking an arbitrary middle grid point that no worker may actually occupy.
+function representative_firm(eq::Equilibrium)
+    p = eq.p
+    emp_idx = findall(eq.sim.emp)
+    if isempty(emp_idx)
+        return (p.n_z + 1) ÷ 2, (p.n_ell + 1) ÷ 2   # fallback
+    end
+    iz = clamp(round(Int, median(eq.sim.fz[emp_idx])), 1, p.n_z)
+    il = clamp(round(Int, median(eq.sim.fl[emp_idx])), 1, p.n_ell)
+    return iz, il
+end
 
 function report_equilibrium(eq::Equilibrium)
     p = eq.p; theta = eq.theta
@@ -571,8 +598,8 @@ function report_equilibrium(eq::Equilibrium)
     frac = count(x -> x <= p.a_grid[1] + 1e-6, eq.sim.assets) / length(eq.sim.assets)
     println(@sprintf("  %% at borrowing constraint = %.1f%%", 100*frac))
 
-    println("\n--- Savings policy spot-check (employed, mid productivity) ---")
-    iz = (p.n_z + 1) ÷ 2; il = (p.n_ell + 1) ÷ 2
+    println("\n--- Savings policy spot-check (employed, representative firm) ---")
+    iz, il = representative_firm(eq)
     w  = nash_wage(p.z_grid[iz], p.ell_grid[il], theta, p)
     println(@sprintf("  firm (z=%.3f, ell=%.2f), wage = %.4f", p.z_grid[iz], p.ell_grid[il], w))
     println(@sprintf("  %-10s %-10s %-10s", "a", "a'(saved)", "c"))
@@ -592,36 +619,45 @@ end
 
 function make_plots(eq::Equilibrium; outdir::String=".")
     p = eq.p; theta = eq.theta
-    iz = (p.n_z + 1) ÷ 2; il = (p.n_ell + 1) ÷ 2
-    w  = nash_wage(p.z_grid[iz], p.ell_grid[il], theta, p)
+
+    # Precompute the wage at every firm state (for consumption)
+    wage = [nash_wage(p.z_grid[iz], p.ell_grid[il], theta, p)
+            for iz in 1:p.n_z, il in 1:p.n_ell]
 
     # 1. Wealth distribution
     plt1 = histogram(eq.sim.assets; bins=50, xlabel="assets a",
         ylabel="number of workers", title="Stationary Wealth Distribution", legend=false)
     savefig(plt1, joinpath(outdir, "wealth_distribution.png"))
 
-    # 2. Savings policy a'(a)
-    ap_emp   = [eq.apW[ia, iz, il] for ia in 1:p.n_a]
-    ap_unemp = [eq.apU[ia]         for ia in 1:p.n_a]
-    plt2 = plot(p.a_grid, ap_emp; label="employed", xlabel="assets today a",
+    # 2. Savings policy a'(a): min and max across ALL firm (z,ell) states
+    apW_min = [minimum(@view eq.apW[ia, :, :]) for ia in 1:p.n_a]
+    apW_max = [maximum(@view eq.apW[ia, :, :]) for ia in 1:p.n_a]
+    plt2 = plot(p.a_grid, apW_max; label="employed (best firm)", xlabel="assets today a",
         ylabel="assets tomorrow a'", title="Savings Policy", lw=2)
-    plot!(plt2, p.a_grid, ap_unemp; label="unemployed", lw=2)
+    plot!(plt2, p.a_grid, apW_min; label="employed (worst firm)", lw=2)
+    plot!(plt2, p.a_grid, eq.apU;  label="unemployed", lw=2)
     plot!(plt2, p.a_grid, p.a_grid; label="45 degree", ls=:dash, lc=:gray)
     savefig(plt2, joinpath(outdir, "savings_policy.png"))
 
-    # 3. Consumption policy c(a)
-    c_emp   = [(1+p.r)*p.a_grid[ia] + w   - eq.apW[ia, iz, il] for ia in 1:p.n_a]
-    c_unemp = [(1+p.r)*p.a_grid[ia] + p.b - eq.apU[ia]         for ia in 1:p.n_a]
-    plt3 = plot(p.a_grid, c_emp; label="employed", xlabel="assets a",
+    # 3. Consumption policy c(a): min and max across ALL firm (z,ell) states
+    cmat = [(1+p.r)*p.a_grid[ia] + wage[iz, il] - eq.apW[ia, iz, il]
+            for ia in 1:p.n_a, iz in 1:p.n_z, il in 1:p.n_ell]
+    c_min = [minimum(@view cmat[ia, :, :]) for ia in 1:p.n_a]
+    c_max = [maximum(@view cmat[ia, :, :]) for ia in 1:p.n_a]
+    c_un  = [(1+p.r)*p.a_grid[ia] + p.b - eq.apU[ia] for ia in 1:p.n_a]
+    plt3 = plot(p.a_grid, c_max; label="employed (best firm)", xlabel="assets a",
         ylabel="consumption c", title="Consumption Policy", lw=2)
-    plot!(plt3, p.a_grid, c_unemp; label="unemployed", lw=2)
+    plot!(plt3, p.a_grid, c_min; label="employed (worst firm)", lw=2)
+    plot!(plt3, p.a_grid, c_un;  label="unemployed", lw=2)
     savefig(plt3, joinpath(outdir, "consumption_policy.png"))
 
-    # 4. Value functions
-    W_slice = [eq.W[ia, iz, il] for ia in 1:p.n_a]
-    plt4 = plot(p.a_grid, W_slice; label="W (employed)", xlabel="assets a",
-        ylabel="value", title="Value Functions", lw=2)
-    plot!(plt4, p.a_grid, eq.U; label="U (unemployed)", lw=2)
+    # 4. Value functions: min and max W across ALL firm (z,ell) states, vs U
+    W_min = [minimum(@view eq.W[ia, :, :]) for ia in 1:p.n_a]
+    W_max = [maximum(@view eq.W[ia, :, :]) for ia in 1:p.n_a]
+    plt4 = plot(p.a_grid, W_max; label="W (best firm)", xlabel="assets a",
+        ylabel="value", title="Value Functions (range across all firms)", lw=2)
+    plot!(plt4, p.a_grid, W_min; label="W (worst firm)", lw=2)
+    plot!(plt4, p.a_grid, eq.U;  label="U (unemployed)", lw=2, lc=:black, ls=:dash)
     savefig(plt4, joinpath(outdir, "value_functions.png"))
 
     # 5. Firm value and vacancies by productivity (at ell = 1)
