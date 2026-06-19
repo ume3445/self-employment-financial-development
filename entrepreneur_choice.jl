@@ -358,11 +358,17 @@ function plot_occupation(sol; outdir::String=".")
     # 3. Value functions vs assets at median ability
     #    (start at index 2: a=0 is degenerate for an entrepreneur — zero wealth
     #     means zero capital and zero output, so its value is not meaningful)
+    #    y-axis is clamped so a single extreme low-asset value cannot blow up
+    #    the scale and flatten the meaningful curves.
     iz_med = (p.n_z + 1) ÷ 2
     rng = 2:p.n_a
+    ytop = maximum([maximum(sol.Vw[rng, iz_med]),
+                    maximum(sol.Ve[rng, iz_med]),
+                    maximum(sol.Vu[rng, iz_med])])
     plt3 = plot(p.a_grid[rng], sol.Vw[rng, iz_med]; label="worker", lw=2,
         xlabel="assets a", ylabel="value",
-        title="Value by Occupation (median ability z)")
+        title="Value by Occupation (median ability z)",
+        ylims=(-10, ytop + 5))
     plot!(plt3, p.a_grid[rng], sol.Ve[rng, iz_med]; label="entrepreneur", lw=2)
     plot!(plt3, p.a_grid[rng], sol.Vu[rng, iz_med]; label="unemployed (max)", lw=2, ls=:dash, lc=:black)
     savefig(plt3, joinpath(outdir, "occupation_values.png"))
