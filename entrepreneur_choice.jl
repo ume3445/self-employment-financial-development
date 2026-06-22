@@ -59,7 +59,10 @@ struct EParams
 
     # labor-market objects taken from the DMP equilibrium:
     w      :: Float64    # going wage entrepreneurs pay / workers earn
-    f_job  :: Float64    # job-finding rate for searching workers
+    A_m    :: Float64    # matching efficiency (Cobb-Douglas matching function)
+    xi_m   :: Float64    # matching elasticity w.r.t. unemployment
+    theta  :: Float64    # market tightness v/u (from the DMP equilibrium)
+    f_job  :: Float64    # job-finding rate: f_job = A_m * theta^(1-xi_m)  [DERIVED]
     s      :: Float64    # job-separation rate for employed workers
     b      :: Float64    # unemployment benefit
 
@@ -86,7 +89,9 @@ function make_eparams(;
     d_E    = 0.05,      # entrepreneur destruction prob
     cf     = 0.50,      # fixed per-period operating cost (deters low-ability entry)
     w      = 0.80,      # <-- from DMP equilibrium (nash_wage at typical firm)
-    f_job  = 0.90,      # <-- from DMP equilibrium (f_theta)
+    A_m    = 0.70,      # matching efficiency (same as DMP model)
+    xi_m   = 0.50,      # matching elasticity (same as DMP model)
+    theta  = 1.6734,    # <-- market tightness from the DMP equilibrium
     s      = 0.03,
     b      = 0.40,
     n_z    = 7,
@@ -99,8 +104,11 @@ function make_eparams(;
     z_grid, Pi_z, _ = tauchen_e(n_z, rho_z, sig_z)
     z_grid = exp.(z_grid)
     a_grid = a_min .+ (a_max - a_min) .* (range(0, 1, length=n_a)).^2
+    # job-finding rate DERIVED from the Cobb-Douglas matching function,
+    # f_job = mu/u = A_m * theta^(1-xi_m). It is NOT a free parameter.
+    f_job = A_m * theta^(1.0 - xi_m)
     return EParams(beta, sigma, r, alpha, nu, lambda, phi, d_E, cf,
-                   w, f_job, s, b, n_z, z_grid, Pi_z, n_a, a_min, a_max, a_grid)
+                   w, A_m, xi_m, theta, f_job, s, b, n_z, z_grid, Pi_z, n_a, a_min, a_max, a_grid)
 end
 
 # Tauchen (same method as the main model)
@@ -208,9 +216,10 @@ end
 function solve_occupation(p::EParams; tol=1e-7, max_iter=2000, verbose=false)
     nz, na = p.n_z, p.n_a
 
-    Vu = zeros(na, nz)   # value of being unemployed and CHOOSING occupation
-    Vw = zeros(na, nz)   # value of being an employed worker
+    Vu = zeros(na, nz)   # value of being unemployed (chooses search vs entrepreneurship)
+    Vw = zeros(na, nz)   # value of being an employed worker (may quit to entrepreneurship)
     Ve = zeros(na, nz)   # value of being an entrepreneur
+    Vw_stay = zeros(na, nz)  # pure value of STAYING a worker (for plotting the occupation lines)
 
     apU = zeros(na, nz)  # savings policies
     apW = zeros(na, nz)
@@ -226,6 +235,7 @@ function solve_occupation(p::EParams; tol=1e-7, max_iter=2000, verbose=false)
 
     for iter in 1:max_iter
         Vu_new = similar(Vu); Vw_new = similar(Vw); Ve_new = similar(Ve)
+        Vwstay_new = similar(Vw_stay)
 
         for iz in 1:nz
             # expected next-period value over z', for each occupation
@@ -239,44 +249,49 @@ function solve_occupation(p::EParams; tol=1e-7, max_iter=2000, verbose=false)
             for ia in 1:na
                 a = p.a_grid[ia]
 
-                # ---------- WORKER ----------
-                resW = (1+p.r)*a + p.w
-                apmaxW = min(resW - 1e-8, p.a_grid[end])
-                contW(ap) = (1-p.s)*interp_a(EVw,p,ap) + p.s*interp_a(EVu,p,ap)
-                if apmaxW <= p.a_min
-                    ap = p.a_min
-                    Vw_new[ia,iz] = util(resW-ap,p) + p.beta*contW(ap); apW[ia,iz]=ap
-                else
-                    rr = optimize(ap -> -(util(resW-ap,p)+p.beta*contW(ap)), p.a_min, apmaxW, Brent())
-                    apW[ia,iz] = Optim.minimizer(rr); Vw_new[ia,iz] = -Optim.minimum(rr)
-                end
-
                 # ---------- ENTREPRENEUR ----------
-                # income = profit minus fixed operating cost cf; on destruction
-                # lose (1-phi)*k and go unemployed
+                # Computed first because BOTH workers and the unemployed can
+                # switch into entrepreneurship. Income = profit minus fixed
+                # operating cost cf; on destruction lose (1-phi)*k and go unemployed.
                 resE = (1+p.r)*a + prof[ia,iz] - p.cf
                 apmaxE = min(resE - 1e-8, p.a_grid[end])
-                # destruction: assets next period reduced by (1-phi)*k, then unemployed
                 a_after_destruction(ap) = max(ap - (1-p.phi)*kpol[ia,iz], p.a_min)
                 contE(ap) = (1-p.d_E)*interp_a(EVe,p,ap) +
                             p.d_E*interp_a(EVu,p,a_after_destruction(ap))
                 if apmaxE <= p.a_min
                     ap = p.a_min
-                    Ve_new[ia,iz] = util(resE-ap,p) + p.beta*contE(ap); apE[ia,iz]=ap
+                    Ve_ia = util(resE-ap,p) + p.beta*contE(ap); apE[ia,iz]=ap
                 else
                     rr = optimize(ap -> -(util(resE-ap,p)+p.beta*contE(ap)), p.a_min, apmaxE, Brent())
-                    apE[ia,iz] = Optim.minimizer(rr); Ve_new[ia,iz] = -Optim.minimum(rr)
+                    apE[ia,iz] = Optim.minimizer(rr); Ve_ia = -Optim.minimum(rr)
                 end
+                Ve_new[ia,iz] = Ve_ia
+
+                # ---------- WORKER (may QUIT to entrepreneurship) ----------
+                # A worker is not trapped: each period they can keep working or
+                # walk away and start a firm. This is what stops an unemployed
+                # person from looking "better off" than a worker.
+                resW = (1+p.r)*a + p.w
+                apmaxW = min(resW - 1e-8, p.a_grid[end])
+                contW(ap) = (1-p.s)*interp_a(EVw,p,ap) + p.s*interp_a(EVu,p,ap)
+                if apmaxW <= p.a_min
+                    ap = p.a_min
+                    workstay = util(resW-ap,p) + p.beta*contW(ap); apW[ia,iz]=ap
+                else
+                    rr = optimize(ap -> -(util(resW-ap,p)+p.beta*contW(ap)), p.a_min, apmaxW, Brent())
+                    apW[ia,iz] = Optim.minimizer(rr); workstay = -Optim.minimum(rr)
+                end
+                Vwstay_new[ia,iz] = workstay
+                Vw_new[ia,iz]     = max(workstay, Ve_ia)   # quit option
 
                 # ---------- UNEMPLOYED (searches) + OCCUPATIONAL CHOICE ----------
                 # This period: benefit b, choose savings. Next period: find a job
-                # (prob f_job) and become a worker if that beats searching; else
-                # remain unemployed. The entrepreneurship option is taken now if
-                # Ve exceeds the search value (occupational choice).
+                # with prob f_job (becoming a worker, who already holds the quit
+                # option, so no extra max needed) or keep searching. The
+                # entrepreneurship option is taken now if it beats searching.
                 resU = (1+p.r)*a + p.b
                 apmaxU = min(resU - 1e-8, p.a_grid[end])
-                contU(ap) = p.f_job*max(interp_a(EVw,p,ap), interp_a(EVu,p,ap)) +
-                            (1-p.f_job)*interp_a(EVu,p,ap)
+                contU(ap) = p.f_job*interp_a(EVw,p,ap) + (1-p.f_job)*interp_a(EVu,p,ap)
                 if apmaxU <= p.a_min
                     ap = p.a_min
                     search_val = util(resU-ap,p) + p.beta*contU(ap); apU[ia,iz]=ap
@@ -286,12 +301,10 @@ function solve_occupation(p::EParams; tol=1e-7, max_iter=2000, verbose=false)
                 end
 
                 # OCCUPATIONAL CHOICE: search vs become entrepreneur
-                if Ve_new[ia,iz] > search_val
-                    Vu_new[ia,iz] = Ve_new[ia,iz]
-                    occ[ia,iz]    = 2          # chooses entrepreneurship
+                if Ve_ia > search_val
+                    Vu_new[ia,iz] = Ve_ia;       occ[ia,iz] = 2
                 else
-                    Vu_new[ia,iz] = search_val
-                    occ[ia,iz]    = 1          # chooses to search for work
+                    Vu_new[ia,iz] = search_val;  occ[ia,iz] = 1
                 end
             end
         end
@@ -299,13 +312,13 @@ function solve_occupation(p::EParams; tol=1e-7, max_iter=2000, verbose=false)
         err = max(maximum(abs.(Vu_new-Vu)),
                   maximum(abs.(Vw_new-Vw)),
                   maximum(abs.(Ve_new-Ve)))
-        Vu .= Vu_new; Vw .= Vw_new; Ve .= Ve_new
+        Vu .= Vu_new; Vw .= Vw_new; Ve .= Ve_new; Vw_stay .= Vwstay_new
         verbose && iter % 25 == 0 &&
             println(@sprintf("  occ VFI iter %4d | error = %.2e", iter, err))
         err < tol && break
     end
 
-    return (Vu=Vu, Vw=Vw, Ve=Ve, occ=occ,
+    return (Vu=Vu, Vw=Vw, Ve=Ve, Vw_stay=Vw_stay, occ=occ,
             prof=prof, kpol=kpol, lpol=lpol,
             apU=apU, apW=apW, apE=apE, p=p)
 end
@@ -355,22 +368,24 @@ function plot_occupation(sol; outdir::String=".")
         title="Entrepreneur Firm Size by Ability (median assets)")
     savefig(plt2, joinpath(outdir, "entrepreneur_size.png"))
 
-    # 3. Value functions vs assets at median ability
-    #    (start at index 2: a=0 is degenerate for an entrepreneur — zero wealth
-    #     means zero capital and zero output, so its value is not meaningful)
-    #    y-axis is clamped so a single extreme low-asset value cannot blow up
-    #    the scale and flatten the meaningful curves.
+    # 3. Value functions vs assets at median ability.
+    #    worker      = value of staying an employed worker
+    #    entrepreneur= value of running a firm
+    #    best choice = max(worker, entrepreneur) -- the envelope, which by
+    #                  construction never sits above BOTH lines.
+    #    (start at index 2: a=0 is degenerate for an entrepreneur)
     iz_med = (p.n_z + 1) ÷ 2
     rng = 2:p.n_a
-    ytop = maximum([maximum(sol.Vw[rng, iz_med]),
-                    maximum(sol.Ve[rng, iz_med]),
-                    maximum(sol.Vu[rng, iz_med])])
-    plt3 = plot(p.a_grid[rng], sol.Vw[rng, iz_med]; label="worker", lw=2,
+    wline = sol.Vw_stay[rng, iz_med]
+    eline = sol.Ve[rng, iz_med]
+    best  = max.(wline, eline)
+    ytop  = maximum(best)
+    plt3 = plot(p.a_grid[rng], wline; label="worker", lw=2,
         xlabel="assets a", ylabel="value",
         title="Value by Occupation (median ability z)",
         ylims=(-10, ytop + 5))
-    plot!(plt3, p.a_grid[rng], sol.Ve[rng, iz_med]; label="entrepreneur", lw=2)
-    plot!(plt3, p.a_grid[rng], sol.Vu[rng, iz_med]; label="unemployed (max)", lw=2, ls=:dash, lc=:black)
+    plot!(plt3, p.a_grid[rng], eline; label="entrepreneur", lw=2)
+    plot!(plt3, p.a_grid[rng], best;  label="best choice", lw=2, ls=:dash, lc=:black)
     savefig(plt3, joinpath(outdir, "occupation_values.png"))
 
     println("\nSaved 3 plots to: $(abspath(outdir))")
