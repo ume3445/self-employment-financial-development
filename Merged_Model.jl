@@ -36,7 +36,7 @@
 # data.
 # =============================================================================
 
-using LinearAlgebra, Statistics, Printf, Optim, Plots
+using LinearAlgebra, Statistics, Printf, Optim, Plots, Random
 
 # =============================================================================
 # SECTION 1: Parameters
@@ -84,11 +84,11 @@ end
 
 function make_params(;
     beta=0.96, sigma=2.0, b=0.40,
-    alpha=0.33, k=1.0, r=0.03,
-    s=0.03, d=0.02, eta=0.50, kappa_v=0.50, kappa_e=1.0, cf=0.50,
-    A=0.70, xi=0.50,
+    alpha=0.33, k=4.0, r=0.03,
+    s=0.03, d=0.02, eta=0.40, kappa_v=0.30, kappa_e=5.0, cf=0.50,
+    A=0.30, xi=0.50,
     n_z=7, rho_z=0.90, sigma_z=0.20,
-    n_ell=30, ell_max=15.0,
+    n_ell=30, ell_max=40.0,
     n_a=80, a_min=0.0, a_max=50.0,
 )
     z_grid, Pi_z, pi_z = tauchen(n_z, rho_z, sigma_z)
@@ -132,8 +132,8 @@ util(c,p) = c<=1e-10 ? -1e6 : (abs(p.sigma-1)<1e-8 ? log(c) : (c^(1-p.sigma)-1)/
 # SECTION 2: Matching, Production, Wage  (shared building blocks)
 # =============================================================================
 
-f_theta(theta,p) = p.A*theta^(1-p.xi)    # job-finding rate (DERIVED, not a parameter)
-q_theta(theta,p) = p.A*theta^(-p.xi)     # vacancy-filling rate
+f_theta(theta,p) = min(p.A*theta^(1-p.xi), 1.0)    # job-finding rate (prob, capped at 1)
+q_theta(theta,p) = min(p.A*theta^(-p.xi), 1.0)     # vacancy-filling rate (prob, capped at 1)
 
 f_prod(z,ell,p) = ell<=0.0 ? 0.0 : z*p.k^p.alpha*ell^(1-p.alpha)
 # MPL is evaluated at a floor of the smallest positive firm size: under
@@ -222,7 +222,7 @@ function bisect(f,lo,hi; tol=1e-6, max_iter=60, verbose=true)
     return mid
 end
 
-function solve_labor_market(p; theta_lo=0.05, theta_hi=8.0)
+function solve_labor_market(p; theta_lo=0.05, theta_hi=20.0)
     println("[1/2] Labor market: solving theta via free entry ...")
     rlo=free_entry_residual(theta_lo,p); rhi=free_entry_residual(theta_hi,p)
     println(@sprintf("      entry residual: theta=%.2f -> %+.4f | theta=%.2f -> %+.4f",
@@ -241,34 +241,53 @@ end
 # =============================================================================
 # SECTION 4: HOUSEHOLD BLOCK with OCCUPATIONAL CHOICE
 #
-# Given theta, the firm value E_firm(z,ell), and the vacancy policy from the
-# labor market, solve the household problem over (assets a, ability z):
+# Given theta and the firm's vacancy policy v_pol from the labor market, solve
+# the household problem. The unemployed/worker states are (assets a, ability z);
+# the ENTREPRENEUR state adds the firm's current size ell -> (a, z, ell):
 #
-#   Vu(a,z): unemployed -> max( search for a job , start a firm )
-#   Vw(a,z): employed worker -> max( keep working , quit to start a firm )
-#   Ve(a,z): entrepreneur -> runs a firm (starts at ell=0, grows via hiring)
+#   Vu(a,z):      unemployed -> max( search for a job , start a firm at ell=0 )
+#   Vw(a,z):      worker     -> max( keep working , quit to start a firm )
+#   Ve(a,z,ell):  entrepreneur running a firm of current size ell
 #
-# A worker earns the Nash wage at the firm they're in. To keep the state at
-# (a, z) per decision 1a, the worker's wage is summarized by w(z, ell) at the
-# firm they belong to; an entrepreneur's value already integrates the firm's
-# growth path via E_firm. The entrepreneur's flow payoff each period is the
-# firm's profit net of the fixed operating cost cf.
+# CONSISTENCY WITH THE LABOR BLOCK (the fix):
+#   The entrepreneur's per-period payoff is the firm's ACTUAL operating profit
+#   pi_firm(z, ell, w(z,ell)) - cf at the firm's current size ell, and the firm
+#   grows along the SAME law of motion and SAME vacancy policy v_pol used to
+#   compute E_firm in the labor block:  ell' = (1-s)*ell + q(theta)*v_pol(z,ell).
+#   A new firm starts at ell=0. So the entrepreneur consumes exactly the profit
+#   stream that underlies E_firm(z,0); the household value differs from E_firm
+#   only by (i) CRRA utility vs the firm block's risk-neutral PV, (ii) the
+#   savings/borrowing margin, and (iii) the voluntary-exit option below. This
+#   replaces the old steady-state-profit summary (prof_ss), which charged the
+#   entrepreneur the fully-grown profit every period and ignored the start-up
+#   phase and mean reversion.
 #
-# Savings: every occupation chooses a' by continuous optimization, with the
-# borrowing constraint a' >= a_min.
+# EXIT OPTION: an incumbent entrepreneur may shut the firm down and return to
+#   unemployment, Ve = max( operate , Vu ). Without this an entrepreneur is
+#   trapped paying cf forever; when z mean-reverts to a low value the firm runs
+#   a loss with no way out, which (through negative consumption -> -1e6) poisons
+#   the whole entrepreneur value and is what drove the 0%-entrepreneur result.
+#
+# Workers are still summarized at (a,z): the wage is the Nash wage at a steady-
+# size firm of productivity z (decision 1a). Savings a' is chosen by continuous
+# optimization subject to a' >= a_min.
 # =============================================================================
 
-function solve_household(theta, E_firm, v_pol, p; tol=1e-7, max_iter=2000, verbose=false)
+function solve_household(theta, E_firm, v_pol, p;
+                         tol=1e-7, max_iter=2000, verbose=false,
+                         n_ell_e=20, ell_max_e=6.0)
     nz, na = p.n_z, p.n_a
     ft = f_theta(theta,p)
     delta = p.s + p.d - p.s*p.d
-
-    # Entrepreneur per-period profit flow by (z): a firm grows from ell=0, but
-    # for the household value we use the firm's average operating profit at its
-    # optimal size path, summarized by the steady firm size for productivity z.
-    # We take the firm's profit at the size it converges to under v_pol.
-    # ell_ss(z): iterate ell' = (1-s)*ell + q(theta)*v*(z,ell) to a fixed point.
     qt = q_theta(theta,p)
+
+    # Household firm-size grid for the entrepreneur value Ve(a,z,ell). Firms
+    # start at ell=0 and grow toward ell_ss(z) (<= ell_ss of the top z), so the
+    # grid spans [0, ell_max_e] with headroom above the largest steady size.
+    ell_grid_e = collect(range(0.0, ell_max_e, length=n_ell_e))
+
+    # ell_ss(z), prof_ss(z): the firm's steady size and profit (labor-side
+    # objects, kept for reporting and for the worker wage summary).
     ell_ss = zeros(nz); prof_ss = zeros(nz)
     for iz in 1:nz
         ell = 0.0
@@ -278,43 +297,76 @@ function solve_household(theta, E_firm, v_pol, p; tol=1e-7, max_iter=2000, verbo
             abs(en-ell)<1e-10 && (ell=en; break); ell=en
         end
         ell_ss[iz] = ell
-        w = nash_wage(p.z_grid[iz], ell, theta, p)
-        prof_ss[iz] = pi_firm(p.z_grid[iz], ell, w, p)   # firm profit at steady size
+        prof_ss[iz] = pi_firm(p.z_grid[iz], ell, nash_wage(p.z_grid[iz],ell,theta,p), p)
     end
 
     # worker wage by (z): wage at the firm's steady size (1a summary)
     wage_z = [nash_wage(p.z_grid[iz], ell_ss[iz], theta, p) for iz in 1:nz]
 
-    Vu=zeros(na,nz); Vw=zeros(na,nz); Ve=zeros(na,nz); Vw_stay=zeros(na,nz)
-    apU=zeros(na,nz); apW=zeros(na,nz); apE=zeros(na,nz); occ=zeros(Int,na,nz)
+    # Pre-tabulate, for each (z, ell) node: operating profit and next firm size
+    # under the labor block's vacancy policy. (Independent of assets, so done
+    # once.)
+    prof_e = zeros(nz, n_ell_e); ellp_e = zeros(nz, n_ell_e)
+    for iz in 1:nz, iel in 1:n_ell_e
+        z = p.z_grid[iz]; ell = ell_grid_e[iel]
+        prof_e[iz,iel] = pi_firm(z, ell, nash_wage(z,ell,theta,p), p)
+        v = interp_ell(p.ell_grid, v_pol[iz,:], ell)
+        ellp_e[iz,iel] = (1-p.s)*ell + qt*v
+    end
+
+    Vu=zeros(na,nz); Vw=zeros(na,nz); Vw_stay=zeros(na,nz)
+    Ve=zeros(na,nz,n_ell_e)          # entrepreneur value WITH exit option
+    Ve_op=zeros(na,nz,n_ell_e)       # value of OPERATING (no exit) this period
+    apU=zeros(na,nz); apW=zeros(na,nz)
+    apE=zeros(na,nz,n_ell_e); exitE=falses(na,nz,n_ell_e)
+    occ=zeros(Int,na,nz)             # 1=search, 2=start firm (unemployed choice)
+
+    iel0 = 1                         # ell_grid_e[1] == 0.0 (entry size)
 
     for iter in 1:max_iter
-        Vun=similar(Vu); Vwn=similar(Vw); Ven=similar(Ve); Vwsn=similar(Vw_stay)
+        Vun=copy(Vu); Vwn=copy(Vw); Vwsn=copy(Vw_stay)
+        Ven=copy(Ve); Ve_opn=copy(Ve_op)
         for iz in 1:nz
-            EVu=zeros(na); EVw=zeros(na); EVe=zeros(na)
+            # z-expectations of the (a,z) value functions
+            EVu=zeros(na); EVw=zeros(na)
             for iz2 in 1:nz
                 EVu .+= p.Pi_z[iz,iz2].*Vu[:,iz2]
                 EVw .+= p.Pi_z[iz,iz2].*Vw[:,iz2]
-                EVe .+= p.Pi_z[iz,iz2].*Ve[:,iz2]
             end
-            w = wage_z[iz]; prof = prof_ss[iz]
+
+            # ---- ENTREPRENEUR: operate value Ve_op(a,z,ell) over the ell grid
+            for iel in 1:n_ell_e
+                prof = prof_e[iz,iel]; ellp = ellp_e[iz,iel]
+                # E[ Ve(a', z', ell') ] over z', evaluated at the (deterministic)
+                # next firm size ell' -> a vector over a'. ell' is fixed given
+                # (z,ell), so interpolate the ell-dimension of Ve once here.
+                EVe_ellp=zeros(na)
+                for iz2 in 1:nz
+                    w2=p.Pi_z[iz,iz2]; w2==0.0 && continue
+                    @inbounds for ia in 1:na
+                        EVe_ellp[ia] += w2*interp_ell(ell_grid_e, view(Ve,ia,iz2,:), ellp)
+                    end
+                end
+                contE(ap)=(1-p.d)*interp_a(EVe_ellp,p,ap)+p.d*interp_a(EVu,p,ap)
+                for ia in 1:na
+                    a=p.a_grid[ia]
+                    resE=(1+p.r)*a + prof - p.cf
+                    aMaxE=min(resE-1e-8, p.a_grid[end])
+                    if aMaxE<=p.a_min
+                        ap=p.a_min; op=util(resE-ap,p)+p.beta*contE(ap)
+                    else
+                        rr=optimize(ap->-(util(resE-ap,p)+p.beta*contE(ap)),p.a_min,aMaxE,Brent())
+                        ap=Optim.minimizer(rr); op=-Optim.minimum(rr)
+                    end
+                    apE[ia,iz,iel]=ap; Ve_opn[ia,iz,iel]=op
+                end
+            end
+
             for ia in 1:na
                 a=p.a_grid[ia]
 
-                # ENTREPRENEUR: flow = profit - cf; destroyed -> unemployed
-                resE=(1+p.r)*a + prof - p.cf
-                aMaxE=min(resE-1e-8, p.a_grid[end])
-                contE(ap)=(1-p.d)*interp_a(EVe,p,ap)+p.d*interp_a(EVu,p,ap)
-                if aMaxE<=p.a_min
-                    ap=p.a_min; Veia=util(resE-ap,p)+p.beta*contE(ap); apE[ia,iz]=ap
-                else
-                    rr=optimize(ap->-(util(resE-ap,p)+p.beta*contE(ap)),p.a_min,aMaxE,Brent())
-                    apE[ia,iz]=Optim.minimizer(rr); Veia=-Optim.minimum(rr)
-                end
-                Ven[ia,iz]=Veia
-
-                # WORKER: earn wage; separate to unemployment at rate delta;
-                # may quit to entrepreneurship
+                # WORKER: earn wage; separate to unemployment at rate delta
+                w=wage_z[iz]
                 resW=(1+p.r)*a + w
                 aMaxW=min(resW-1e-8, p.a_grid[end])
                 contW(ap)=(1-delta)*interp_a(EVw,p,ap)+delta*interp_a(EVu,p,ap)
@@ -325,10 +377,8 @@ function solve_household(theta, E_firm, v_pol, p; tol=1e-7, max_iter=2000, verbo
                     apW[ia,iz]=Optim.minimizer(rr); ws=-Optim.minimum(rr)
                 end
                 Vwsn[ia,iz]=ws
-                Vwn[ia,iz]=max(ws, Veia)     # quit option
 
-                # UNEMPLOYED: benefit b; find job w/ prob ft -> worker; else search.
-                # Occupational choice: search vs start a firm.
+                # UNEMPLOYED: benefit b; find job w/ prob ft -> worker; else search
                 resU=(1+p.r)*a + p.b
                 aMaxU=min(resU-1e-8, p.a_grid[end])
                 contU(ap)=ft*interp_a(EVw,p,ap)+(1-ft)*interp_a(EVu,p,ap)
@@ -338,22 +388,147 @@ function solve_household(theta, E_firm, v_pol, p; tol=1e-7, max_iter=2000, verbo
                     rr=optimize(ap->-(util(resU-ap,p)+p.beta*contU(ap)),p.a_min,aMaxU,Brent())
                     apU[ia,iz]=Optim.minimizer(rr); sv=-Optim.minimum(rr)
                 end
-                if Veia>sv
-                    Vun[ia,iz]=Veia; occ[ia,iz]=2
+
+                # Value of STARTING a firm = operate at entry size ell=0, using
+                # the operate value just computed this sweep (entry, quit, and
+                # exit all reference the same Ve_op-at-ell=0, so it is consistent).
+                start_val = Ve_opn[ia,iz,iel0]
+
+                # occupational choice for the unemployed: search vs start firm
+                if start_val>sv
+                    Vun[ia,iz]=start_val; occ[ia,iz]=2
                 else
                     Vun[ia,iz]=sv; occ[ia,iz]=1
                 end
+                # worker may quit to start a firm
+                Vwn[ia,iz]=max(ws, start_val)
             end
         end
-        err=max(maximum(abs.(Vun-Vu)),maximum(abs.(Vwn-Vw)),maximum(abs.(Ven-Ve)))
-        Vu.=Vun; Vw.=Vwn; Ve.=Ven; Vw_stay.=Vwsn
+
+        # exit option: incumbent entrepreneur shuts down -> unemployed (Vu)
+        for iz in 1:nz, iel in 1:n_ell_e, ia in 1:na
+            if Vun[ia,iz] > Ve_opn[ia,iz,iel]
+                Ven[ia,iz,iel]=Vun[ia,iz]; exitE[ia,iz,iel]=true
+            else
+                Ven[ia,iz,iel]=Ve_opn[ia,iz,iel]; exitE[ia,iz,iel]=false
+            end
+        end
+
+        err=max(maximum(abs.(Vun-Vu)), maximum(abs.(Vwn-Vw)),
+                maximum(abs.(Ve_opn-Ve_op)))
+        Vu.=Vun; Vw.=Vwn; Vw_stay.=Vwsn; Ve.=Ven; Ve_op.=Ve_opn
         verbose && iter%25==0 && println(@sprintf("  household VFI %4d | err=%.2e",iter,err))
         err<tol && break
     end
 
-    return (Vu=Vu, Vw=Vw, Ve=Ve, Vw_stay=Vw_stay, occ=occ,
-            apU=apU, apW=apW, apE=apE,
+    # 2-D slices at entry size ell=0 (for plots, thresholds, and entry/quit
+    # decisions). Ve0 is the value of being an entrepreneur with a brand-new
+    # (zero-worker) firm.
+    Ve0  = Ve_op[:,:,iel0]
+    apE0 = apE[:,:,iel0]
+    # worker quits to entrepreneurship where starting a firm beats staying
+    quitW = Ve0 .> Vw_stay
+
+    return (Vu=Vu, Vw=Vw, Ve=Ve, Ve_op=Ve_op, Ve0=Ve0, Vw_stay=Vw_stay,
+            occ=occ, quitW=quitW, exitE=exitE,
+            apU=apU, apW=apW, apE=apE, apE0=apE0,
+            ell_grid_e=ell_grid_e, v_pol=v_pol,
             ell_ss=ell_ss, prof_ss=prof_ss, wage_z=wage_z, p=p)
+end
+
+
+# =============================================================================
+# SECTION 4b: POPULATION SIMULATION
+#
+# Simulate N people forward for T periods to get the STATIONARY population
+# shares (this is what turns the grid into real population numbers). Each
+# person carries assets a and ability z and is in one of three states:
+#   1 = unemployed, 2 = worker, 3 = entrepreneur.
+#
+# Transitions follow the solved policies. Entrepreneurs now carry firm size ell:
+#   unemployed: if occ(a,z)=start-firm -> entrepreneur at ell=0; else search,
+#               finding a job with prob f(theta) -> worker, else stay unemployed
+#   worker:     if quitW(a,z) -> entrepreneur at ell=0; else separate with prob
+#               delta -> unemployed, else stay worker
+#   entrepreneur: if exitE(a,z,ell) -> shut down, becomes unemployed THIS period
+#               (then acts as unemployed); else operate: save apE(a,z,ell), firm
+#               grows ell' = (1-s)ell + q(theta) v_pol(z,ell); destroyed w/ prob
+#               d -> unemployed (ell reset to 0), else stay entrepreneur at ell'.
+# Ability z evolves via the Markov chain each period. Assets update by the
+# savings policy of the current occupation.
+# =============================================================================
+
+function simulate_population(theta, hh, p; N=20000, T=600, burn=300, seed=1)
+    rng = MersenneTwister(seed)
+    ft = f_theta(theta,p); delta = p.s + p.d - p.s*p.d; qt = q_theta(theta,p)
+
+    # CDF rows for ability transitions
+    cum = cumsum(p.Pi_z, dims=2)
+    cum_pi = cumsum(p.pi_z)
+
+    # initial draw
+    a = fill(0.0, N)
+    z = [searchsortedfirst(cum_pi, rand(rng)) for _ in 1:N]
+    state = fill(1, N)   # everyone starts unemployed
+    ell = fill(0.0, N)   # firm size; only meaningful while state==3
+
+    nearest_a(x) = clamp(searchsortedfirst(p.a_grid, x), 1, p.n_a)
+    nearest_ell(x) = clamp(searchsortedfirst(hh.ell_grid_e, x), 1, length(hh.ell_grid_e))
+
+    share_u=0.0; share_w=0.0; share_e=0.0; nrec=0; ell_sum=0.0; ell_n=0
+    for t in 1:T
+        for i in 1:N
+            ia = nearest_a(a[i]); iz = z[i]
+            # entrepreneur who chooses to exit becomes unemployed THIS period,
+            # then is handled by the unemployed branch below
+            if state[i]==3 && hh.exitE[ia,iz,nearest_ell(ell[i])]
+                state[i]=1; ell[i]=0.0
+            end
+
+            if state[i]==1            # unemployed
+                if hh.occ[ia,iz]==2
+                    a[i]=hh.apE0[ia,iz]; ell[i]=0.0; state[i]=3   # start firm
+                else
+                    a[i]=hh.apU[ia,iz]
+                    state[i] = rand(rng)<ft ? 2 : 1
+                end
+            elseif state[i]==2        # worker
+                if hh.quitW[ia,iz]
+                    a[i]=hh.apE0[ia,iz]; ell[i]=0.0; state[i]=3   # quit -> firm
+                else
+                    a[i]=hh.apW[ia,iz]
+                    state[i] = rand(rng)<delta ? 1 : 2
+                end
+            else                      # entrepreneur, operate firm of size ell
+                iel = nearest_ell(ell[i])
+                a[i]=hh.apE[ia,iz,iel]
+                v = interp_ell(p.ell_grid, hh.v_pol[iz,:], ell[i])
+                ellnew = (1-p.s)*ell[i] + qt*v
+                if rand(rng)<p.d
+                    state[i]=1; ell[i]=0.0          # firm destroyed
+                else
+                    state[i]=3; ell[i]=ellnew
+                end
+            end
+            # ability shock
+            r=rand(rng); z[i]=searchsortedfirst(cum[iz,:], r)
+        end
+        if t>burn
+            share_u += count(==(1),state)/N
+            share_w += count(==(2),state)/N
+            share_e += count(==(3),state)/N
+            for i in 1:N
+                state[i]==3 && (ell_sum += ell[i]; ell_n += 1)
+            end
+            nrec += 1
+        end
+    end
+    share_u/=nrec; share_w/=nrec; share_e/=nrec
+    ell_mean = ell_n>0 ? ell_sum/ell_n : 0.0   # avg firm size among entrepreneurs
+    # unemployment rate = unemployed / (unemployed + workers), excludes entrepreneurs
+    urate = share_u/(share_u+share_w)
+    return (share_u=share_u, share_w=share_w, share_e=share_e, urate=urate,
+            ell_mean=ell_mean, assets=copy(a), states=copy(state), ells=copy(ell))
 end
 
 
@@ -366,17 +541,26 @@ function solve_model(p)
     theta, E_firm, v_pol = solve_labor_market(p)
     println("\n[2/2] Household block with occupational choice ...")
     hh = solve_household(theta, E_firm, v_pol, p; verbose=true)
-    return (theta=theta, E_firm=E_firm, v_pol=v_pol, hh=hh, p=p)
+    println("\nSimulating population for stationary shares ...")
+    sim = simulate_population(theta, hh, p)
+    return (theta=theta, E_firm=E_firm, v_pol=v_pol, hh=hh, sim=sim, p=p)
 end
 
 function report_model(sol)
-    p=sol.p; hh=sol.hh
+    p=sol.p; hh=sol.hh; sim=sol.sim
     println("\n"*"="^64); println("RESULTS"); println("="^64)
     println(@sprintf("\n  theta* = %.4f   f(theta*) = %.4f", sol.theta, f_theta(sol.theta,p)))
+    println("\n  POPULATION SHARES (from simulation, these are the real numbers):")
+    println(@sprintf("    workers       : %.1f%%", 100*sim.share_w))
+    println(@sprintf("    entrepreneurs : %.1f%%", 100*sim.share_e))
+    println(@sprintf("    unemployed    : %.1f%%", 100*sim.share_u))
+    println(@sprintf("    unemployment rate (u / (u+w)) : %.1f%%", 100*sim.urate))
+    println(@sprintf("    avg firm size among entrepreneurs : %.2f workers", sim.ell_mean))
     frac=count(==(2), hh.occ)/length(hh.occ)
-    println(@sprintf("  Entrepreneurship chosen on %.1f%% of the (a,z) grid", 100*frac))
+    println(@sprintf("\n  (For reference: entrepreneurship covers %.1f%% of the (a,z) GRID,", 100*frac))
+    println( "   which is NOT the population share above — the grid is unweighted.)")
     println("\n  Entry threshold: min assets to start a firm, by ability z")
-    println(@sprintf("  %-12s %-14s %-10s","z","min assets","firm size"))
+    println(@sprintf("  %-12s %-14s %-10s","z","min assets","ss firm size"))
     println("  "*"-"^36)
     for iz in 1:p.n_z
         ia=findfirst(==(2), hh.occ[:,iz])
@@ -402,18 +586,20 @@ function plot_model(sol; outdir=".")
     plot!(plt1; legend=:topright)
     savefig(plt1, joinpath(outdir,"merged_occupation_map.png"))
 
+    # value of staying a worker vs starting a firm (entrepreneur value at the
+    # entry firm size ell=0), at a high ability where entry is relevant
     iz=(p.n_z+1)÷2; rng=2:p.n_a
-    wl=hh.Vw_stay[rng,iz]; el=hh.Ve[rng,iz]; best=max.(wl,el)
+    wl=hh.Vw_stay[rng,iz]; el=hh.Ve0[rng,iz]; best=max.(wl,el)
     plt2=plot(p.a_grid[rng], wl; label="worker", lw=2, xlabel="assets a", ylabel="value",
         title="Value by Occupation (median ability z)", ylims=(-10, maximum(best)+5))
-    plot!(plt2, p.a_grid[rng], el; label="entrepreneur", lw=2)
+    plot!(plt2, p.a_grid[rng], el; label="entrepreneur (start a firm)", lw=2)
     plot!(plt2, p.a_grid[rng], best; label="best choice", lw=2, ls=:dash, lc=:black)
     savefig(plt2, joinpath(outdir,"merged_occupation_values.png"))
 
-    # savings policies at median ability
+    # savings policies at median ability (entrepreneur shown at entry size ell=0)
     plt3=plot(p.a_grid, hh.apW[:,iz]; label="worker", lw=2, xlabel="assets a",
         ylabel="next assets a'", title="Savings Policy (median ability z)")
-    plot!(plt3, p.a_grid, hh.apE[:,iz]; label="entrepreneur", lw=2)
+    plot!(plt3, p.a_grid, hh.apE0[:,iz]; label="entrepreneur (ell=0)", lw=2)
     plot!(plt3, p.a_grid, hh.apU[:,iz]; label="unemployed", lw=2)
     plot!(plt3, p.a_grid, p.a_grid; label="45 deg", ls=:dash, lc=:gray)
     savefig(plt3, joinpath(outdir,"merged_savings_policy.png"))
@@ -423,7 +609,12 @@ function plot_model(sol; outdir=".")
         ylabel="steady firm size ell", title="Firm Size by Ability")
     savefig(plt4, joinpath(outdir,"merged_firm_size.png"))
 
-    println("\nSaved 4 plots to: $(abspath(outdir))")
+    # wealth distribution from the simulation
+    plt5=histogram(sol.sim.assets; bins=50, legend=false, xlabel="assets a",
+        ylabel="number of people", title="Stationary Wealth Distribution")
+    savefig(plt5, joinpath(outdir,"merged_wealth_distribution.png"))
+
+    println("\nSaved 5 plots to: $(abspath(outdir))")
 end
 
 function main()
