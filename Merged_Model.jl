@@ -31,9 +31,31 @@
 #   can solve the labor-market block first, then take w(z,ell) and theta as
 #   given when solving the household occupational-choice block.
 #
-# NOTE: still uses a fixed operating cost cf and span control via the DMP
-# size mechanism. cf and other calibration values are not yet disciplined to
-# data.
+# CAPITAL & THE COLLATERAL CONSTRAINT (Change 1, the financial-development core):
+#   Capital is CHOSEN, not fixed. An entrepreneur of productivity z running a
+#   firm of size ell would optimally deploy k*(z,ell) solving MPK = u_k, where
+#   the user cost u_k = r + delta + d (opportunity cost + depreciation + the
+#   capital lost when the firm is destroyed). But capital is limited by the
+#   entrepreneur's own assets via a collateral constraint:
+#        k_eff = min(k*(z,ell), lambda * a).
+#   So a talented-but-poor entrepreneur cannot deploy the capital they'd want.
+#   Production has decreasing returns (span of control nu<1):
+#        output = z * (k^alpha * ell^(1-alpha))^nu .
+#   nu<1 is REQUIRED once k is a choice: under constant returns the optimal k
+#   scales linearly with ell, output becomes linear in ell, and firm size is
+#   indeterminate. The old fixed-k model is the nu=1 special case.
+#
+# SOLVE ORDER UNDER THE CONSTRAINT (honest caveat to 5a):
+#   k_eff depends on the OWNER's assets a, so strictly the firm's profit, wage,
+#   and hiring now depend on a and 5a no longer holds exactly. We PRESERVE the
+#   solve order as a partial-equilibrium approximation: the labor block (theta,
+#   wage schedule w(z,ell), firm value, hiring policy v_pol) is solved at the
+#   UNCONSTRAINED capital k*(z,ell); the collateral constraint bites only in the
+#   household block, where an entrepreneur with assets a produces with k_eff and
+#   takes the market wage schedule as given. Full GE (theta responding to the
+#   entrant wealth distribution) is left for a later step.
+#
+# NOTE: cf and other calibration values are not yet disciplined to data.
 # =============================================================================
 
 using LinearAlgebra, Statistics, Printf, Optim, Plots, Random
@@ -48,9 +70,12 @@ struct Params
     sigma   :: Float64      # CRRA
     b       :: Float64      # unemployment benefit / strike threat point
 
-    # production: firm output = z * k^alpha * ell^(1-alpha)
-    alpha   :: Float64
-    k       :: Float64      # capital per firm (fixed for now)
+    # production: firm output = z * (k^alpha * ell^(1-alpha))^nu, with nu<1.
+    # Capital k is CHOSEN by the entrepreneur subject to k <= lambda*a (Section 2).
+    alpha   :: Float64      # capital share within the CRS aggregate
+    nu      :: Float64      # span of control / returns to scale (nu < 1)
+    delta   :: Float64      # capital depreciation rate
+    lambda  :: Float64      # collateral limit: k_eff <= lambda * assets
     r       :: Float64
 
     # labor market frictions
@@ -84,7 +109,7 @@ end
 
 function make_params(;
     beta=0.96, sigma=2.0, b=0.40,
-    alpha=0.33, k=4.0, r=0.03,
+    alpha=0.33, nu=0.75, delta=0.06, lambda=1.0, r=0.03,
     s=0.03, d=0.02, eta=0.40, kappa_v=0.30, kappa_e=5.0, cf=0.50,
     A=0.30, xi=0.50,
     n_z=7, rho_z=0.90, sigma_z=0.20,
@@ -95,9 +120,9 @@ function make_params(;
     z_grid = exp.(z_grid)
     ell_grid = collect(range(0.0, ell_max, length=n_ell))   # start at 0 workers
     a_grid = a_min .+ (a_max - a_min) .* (range(0,1,length=n_a)).^2
-    return Params(beta, sigma, b, alpha, k, r, s, d, eta, kappa_v, kappa_e, cf,
-                  A, xi, n_z, z_grid, Pi_z, pi_z, n_ell, ell_grid,
-                  n_a, a_min, a_max, a_grid)
+    return Params(beta, sigma, b, alpha, nu, delta, lambda, r, s, d, eta,
+                  kappa_v, kappa_e, cf, A, xi, n_z, z_grid, Pi_z, pi_z,
+                  n_ell, ell_grid, n_a, a_min, a_max, a_grid)
 end
 
 # ---- Tauchen ----
@@ -135,18 +160,47 @@ util(c,p) = c<=1e-10 ? -1e6 : (abs(p.sigma-1)<1e-8 ? log(c) : (c^(1-p.sigma)-1)/
 f_theta(theta,p) = min(p.A*theta^(1-p.xi), 1.0)    # job-finding rate (prob, capped at 1)
 q_theta(theta,p) = min(p.A*theta^(-p.xi), 1.0)     # vacancy-filling rate (prob, capped at 1)
 
-f_prod(z,ell,p) = ell<=0.0 ? 0.0 : z*p.k^p.alpha*ell^(1-p.alpha)
-# MPL is evaluated at a floor of the smallest positive firm size: under
-# Cobb-Douglas the first worker has unbounded marginal product, so the wage
-# bargain must be taken at the size a worker actually joins, not at ell=0.
-MPL(z,ell,p)    = begin
-    ell_eff = max(ell, p.ell_grid[2])
-    (1-p.alpha)*z*p.k^p.alpha*ell_eff^(-p.alpha)
-end
-pi_firm(z,ell,w,p) = f_prod(z,ell,p) - w*ell - p.r*p.k
+# ---- Capital: user cost, optimal (unconstrained) choice, collateral limit ----
+# User cost of capital MPK = r + delta + d : opportunity cost + depreciation +
+# the capital lost when the firm is destroyed (prob d).
+ucost(p) = p.r + p.delta + p.d
 
-# Nash wage: threat point b (strike), so it is independent of worker assets (5a)
-nash_wage(z,ell,theta,p) = p.eta*(MPL(z,ell,p)+p.kappa_v*theta) + (1-p.eta)*p.b
+# Output with span of control: Y = z * (k^alpha * ell^(1-alpha))^nu
+#                                = z * k^(alpha*nu) * ell^((1-alpha)*nu).
+f_output(z,ell,k,p) = (ell<=0.0 || k<=0.0) ? 0.0 :
+    z * k^(p.alpha*p.nu) * ell^((1-p.alpha)*p.nu)
+
+# Unconstrained optimal capital, from MPK = u_k:
+#   k*(z,ell) = (alpha*nu*z/u_k)^(1/(1-alpha*nu)) * ell^((1-alpha)*nu/(1-alpha*nu)).
+function kstar(z,ell,p)
+    ell<=0.0 && return 0.0
+    an = p.alpha*p.nu
+    (an*z/ucost(p))^(1/(1-an)) * ell^(((1-p.alpha)*p.nu)/(1-an))
+end
+
+# Collateral-constrained capital: cannot deploy more than lambda * own assets.
+k_eff(z,ell,a,p) = min(kstar(z,ell,p), p.lambda*a)
+
+# MPL is the marginal product of labor at the firm's CURRENT capital k, evaluated
+# at a floor of the smallest positive firm size (the first worker's MPL is
+# unbounded as ell->0, so the bargain is taken at the size a worker actually
+# joins). MPL = (1-alpha)*nu * Y / ell.
+function MPL(z,ell,k,p)
+    ell_eff = max(ell, p.ell_grid[2])
+    (1-p.alpha)*p.nu * z * k^(p.alpha*p.nu) * ell_eff^((1-p.alpha)*p.nu - 1)
+end
+
+# Firm profit given capital k and wage w (capital charged at its user cost).
+pi_firm(z,ell,k,w,p) = f_output(z,ell,k,p) - w*ell - ucost(p)*k
+
+# Nash wage at capital k: threat point b (strike), independent of worker assets.
+nash_wage(z,ell,k,theta,p) = p.eta*(MPL(z,ell,k,p)+p.kappa_v*theta) + (1-p.eta)*p.b
+
+# Labor-block convenience wrappers: evaluate at the UNCONSTRAINED optimal capital
+# k*(z,ell). These define the market wage schedule and firm profit used to pin
+# theta and the firm value (the 5a-preserving approximation; see header).
+wage_sched(z,ell,theta,p)   = nash_wage(z,ell,kstar(z,ell,p),theta,p)
+pi_firm_unc(z,ell,w,p)      = pi_firm(z,ell,kstar(z,ell,p),w,p)
 
 # interpolation helpers
 function interp_ell(ell_grid, V::AbstractVector, ell)
@@ -184,8 +238,8 @@ function solve_firm_vfi(theta, p; tol=1e-8, max_iter=2000)
             Eexp = zeros(p.n_ell)
             for iz2 in 1:p.n_z; Eexp .+= p.Pi_z[iz,iz2].*E[iz2,:]; end
             for il in 1:p.n_ell
-                ell=p.ell_grid[il]; w=nash_wage(z,ell,theta,p)
-                pif = pi_firm(z,ell,w,p)
+                ell=p.ell_grid[il]; w=wage_sched(z,ell,theta,p)
+                pif = pi_firm_unc(z,ell,w,p)   # unconstrained k* (labor block)
                 obj(v)= begin
                     v=max(v,0.0); en=(1-p.s)*ell+qt*v
                     -(pif - p.kappa_v*v + p.beta*(1-p.d)*interp_ell(p.ell_grid,Eexp,en))
@@ -275,7 +329,7 @@ end
 
 function solve_household(theta, E_firm, v_pol, p;
                          tol=1e-7, max_iter=2000, verbose=false,
-                         n_ell_e=20, ell_max_e=6.0)
+                         n_ell_e=24, ell_max_e=10.0)
     nz, na = p.n_z, p.n_a
     ft = f_theta(theta,p)
     delta = p.s + p.d - p.s*p.d
@@ -297,21 +351,32 @@ function solve_household(theta, E_firm, v_pol, p;
             abs(en-ell)<1e-10 && (ell=en; break); ell=en
         end
         ell_ss[iz] = ell
-        prof_ss[iz] = pi_firm(p.z_grid[iz], ell, nash_wage(p.z_grid[iz],ell,theta,p), p)
+        prof_ss[iz] = pi_firm_unc(p.z_grid[iz], ell, wage_sched(p.z_grid[iz],ell,theta,p), p)
     end
 
-    # worker wage by (z): wage at the firm's steady size (1a summary)
-    wage_z = [nash_wage(p.z_grid[iz], ell_ss[iz], theta, p) for iz in 1:nz]
+    # worker wage by (z): market wage at the firm's steady size (1a summary)
+    wage_z = [wage_sched(p.z_grid[iz], ell_ss[iz], theta, p) for iz in 1:nz]
 
-    # Pre-tabulate, for each (z, ell) node: operating profit and next firm size
-    # under the labor block's vacancy policy. (Independent of assets, so done
-    # once.)
-    prof_e = zeros(nz, n_ell_e); ellp_e = zeros(nz, n_ell_e)
-    for iz in 1:nz, iel in 1:n_ell_e
-        z = p.z_grid[iz]; ell = ell_grid_e[iel]
-        prof_e[iz,iel] = pi_firm(z, ell, nash_wage(z,ell,theta,p), p)
-        v = interp_ell(p.ell_grid, v_pol[iz,:], ell)
-        ellp_e[iz,iel] = (1-p.s)*ell + qt*v
+    # Pre-tabulate entrepreneur operating profit and next firm size. Profit now
+    # depends on the OWNER's assets a through the collateral constraint
+    # k_eff = min(k*(z,ell), lambda*a): a poorer entrepreneur deploys less
+    # capital and earns less. They take the market wage schedule w(z,ell) as
+    # given (5a-preserving) and pay the user cost on their k_eff. Next firm size
+    # ellp follows the labor block's (unconstrained) vacancy policy, so it is a
+    # function of (z,ell) only.
+    prof_e = zeros(na, nz, n_ell_e); ellp_e = zeros(nz, n_ell_e)
+    for iz in 1:nz
+        z = p.z_grid[iz]
+        for iel in 1:n_ell_e
+            ell = ell_grid_e[iel]
+            w = wage_sched(z, ell, theta, p)
+            for ia in 1:na
+                keff = k_eff(z, ell, p.a_grid[ia], p)
+                prof_e[ia,iz,iel] = f_output(z,ell,keff,p) - w*ell - ucost(p)*keff
+            end
+            v = interp_ell(p.ell_grid, v_pol[iz,:], ell)
+            ellp_e[iz,iel] = (1-p.s)*ell + qt*v
+        end
     end
 
     Vu=zeros(na,nz); Vw=zeros(na,nz); Vw_stay=zeros(na,nz)
@@ -336,7 +401,7 @@ function solve_household(theta, E_firm, v_pol, p;
 
             # ---- ENTREPRENEUR: operate value Ve_op(a,z,ell) over the ell grid
             for iel in 1:n_ell_e
-                prof = prof_e[iz,iel]; ellp = ellp_e[iz,iel]
+                ellp = ellp_e[iz,iel]
                 # E[ Ve(a', z', ell') ] over z', evaluated at the (deterministic)
                 # next firm size ell' -> a vector over a'. ell' is fixed given
                 # (z,ell), so interpolate the ell-dimension of Ve once here.
@@ -350,7 +415,7 @@ function solve_household(theta, E_firm, v_pol, p;
                 contE(ap)=(1-p.d)*interp_a(EVe_ellp,p,ap)+p.d*interp_a(EVu,p,ap)
                 for ia in 1:na
                     a=p.a_grid[ia]
-                    resE=(1+p.r)*a + prof - p.cf
+                    resE=(1+p.r)*a + prof_e[ia,iz,iel] - p.cf   # profit uses k_eff(a)
                     aMaxE=min(resE-1e-8, p.a_grid[end])
                     if aMaxE<=p.a_min
                         ap=p.a_min; op=util(resE-ap,p)+p.beta*contE(ap)
@@ -476,6 +541,7 @@ function simulate_population(theta, hh, p; N=20000, T=600, burn=300, seed=1)
     nearest_ell(x) = clamp(searchsortedfirst(hh.ell_grid_e, x), 1, length(hh.ell_grid_e))
 
     share_u=0.0; share_w=0.0; share_e=0.0; nrec=0; ell_sum=0.0; ell_n=0
+    k_sum=0.0; kstar_sum=0.0; constr_n=0   # capital & collateral-constraint stats
     for t in 1:T
         for i in 1:N
             ia = nearest_a(a[i]); iz = z[i]
@@ -518,17 +584,28 @@ function simulate_population(theta, hh, p; N=20000, T=600, burn=300, seed=1)
             share_w += count(==(2),state)/N
             share_e += count(==(3),state)/N
             for i in 1:N
-                state[i]==3 && (ell_sum += ell[i]; ell_n += 1)
+                if state[i]==3
+                    ell_sum += ell[i]; ell_n += 1
+                    ks = kstar(p.z_grid[z[i]], ell[i], p)        # wanted capital
+                    ke = min(ks, p.lambda*a[i])                  # deployed capital
+                    k_sum += ke; kstar_sum += ks
+                    (ks > 0.0 && ke < ks - 1e-9) && (constr_n += 1)
+                end
             end
             nrec += 1
         end
     end
     share_u/=nrec; share_w/=nrec; share_e/=nrec
     ell_mean = ell_n>0 ? ell_sum/ell_n : 0.0   # avg firm size among entrepreneurs
+    k_mean = ell_n>0 ? k_sum/ell_n : 0.0       # avg capital deployed
+    kstar_mean = ell_n>0 ? kstar_sum/ell_n : 0.0
+    frac_constrained = ell_n>0 ? constr_n/ell_n : 0.0
     # unemployment rate = unemployed / (unemployed + workers), excludes entrepreneurs
     urate = share_u/(share_u+share_w)
     return (share_u=share_u, share_w=share_w, share_e=share_e, urate=urate,
-            ell_mean=ell_mean, assets=copy(a), states=copy(state), ells=copy(ell))
+            ell_mean=ell_mean, k_mean=k_mean, kstar_mean=kstar_mean,
+            frac_constrained=frac_constrained,
+            assets=copy(a), states=copy(state), ells=copy(ell))
 end
 
 
@@ -556,16 +633,23 @@ function report_model(sol)
     println(@sprintf("    unemployed    : %.1f%%", 100*sim.share_u))
     println(@sprintf("    unemployment rate (u / (u+w)) : %.1f%%", 100*sim.urate))
     println(@sprintf("    avg firm size among entrepreneurs : %.2f workers", sim.ell_mean))
+    println("\n  CAPITAL & COLLATERAL CONSTRAINT (k_eff = min(k*, lambda*a), lambda=$(p.lambda)):")
+    println(@sprintf("    avg capital deployed (k_eff)         : %.2f", sim.k_mean))
+    println(@sprintf("    avg desired capital (k*)             : %.2f", sim.kstar_mean))
+    println(@sprintf("    entrepreneurs hitting the constraint : %.1f%%", 100*sim.frac_constrained))
     frac=count(==(2), hh.occ)/length(hh.occ)
     println(@sprintf("\n  (For reference: entrepreneurship covers %.1f%% of the (a,z) GRID,", 100*frac))
     println( "   which is NOT the population share above — the grid is unweighted.)")
-    println("\n  Entry threshold: min assets to start a firm, by ability z")
-    println(@sprintf("  %-12s %-14s %-10s","z","min assets","ss firm size"))
-    println("  "*"-"^36)
+    println("\n  Entry threshold: min assets to start a firm, by ability z.")
+    println("  k*(z) is the unconstrained optimal capital at the steady firm size;")
+    println("  if the entry threshold tracks k*, the constraint is what locks people out.")
+    println(@sprintf("  %-10s %-12s %-12s %-12s","z","min assets","ss firm size","k*(z,ss)"))
+    println("  "*"-"^48)
     for iz in 1:p.n_z
         ia=findfirst(==(2), hh.occ[:,iz])
         cut = ia===nothing ? "never" : @sprintf("%.3f", p.a_grid[ia])
-        println(@sprintf("  %-12.4f %-14s %-10.2f", p.z_grid[iz], cut, hh.ell_ss[iz]))
+        ks = kstar(p.z_grid[iz], hh.ell_ss[iz], p)
+        println(@sprintf("  %-10.4f %-12s %-12.2f %-12.2f", p.z_grid[iz], cut, hh.ell_ss[iz], ks))
     end
 end
 
@@ -625,5 +709,9 @@ function main()
     return sol
 end
 
-sol=main();
+# Run the full pipeline only when executed directly (`julia Merged_Model.jl`),
+# not when `include`d by an analysis script (e.g. the lambda sweep).
+if abspath(PROGRAM_FILE) == @__FILE__
+    sol = main()
+end
 nothing
