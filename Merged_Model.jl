@@ -56,6 +56,14 @@
 #   entrant wealth distribution) is left for a later step.
 #
 # NOTE: cf and other calibration values are not yet disciplined to data.
+#
+# ABILITY PROCESS z (Change 2):
+#   Marginal: Pareto on [z_min, inf) with shape alpha_z (fat right tail), discretized
+#   onto n_z equal-probability bins (mid-quantile grid points). Legacy Tauchen/log-normal
+#   available via use_pareto_z=false.
+#   fixed_z=false (default): log-AR(1) persistence on the Pareto grid (rho_z, sigma_z).
+#   fixed_z=true: each person draws z once from the Pareto bins and keeps it for life;
+#   VFI skips z-expectations; simulation never updates z.
 # =============================================================================
 
 using LinearAlgebra, Statistics, Printf, Optim, Plots, Random
@@ -95,6 +103,13 @@ struct Params
     z_grid  :: Vector{Float64}
     Pi_z    :: Matrix{Float64}
     pi_z    :: Vector{Float64}
+    # ability process: Pareto marginal (fat tail) + optional fixed-for-life z
+    use_pareto_z :: Bool     # true = Pareto quantile grid; false = legacy Tauchen/log-normal
+    alpha_z   :: Float64     # Pareto shape (lower = fatter right tail)
+    z_min     :: Float64     # Pareto scale / lower bound on z
+    fixed_z   :: Bool        # true = z drawn once, no transitions; false = Markov persistent
+    rho_z     :: Float64     # log-AR(1) persistence (persistent mode only)
+    sigma_z   :: Float64     # log-AR(1) shock sd   (persistent mode only)
 
     # firm size grid
     n_ell   :: Int
@@ -112,20 +127,97 @@ function make_params(;
     alpha=0.33, nu=0.75, delta=0.06, lambda=1.0, r=0.03,
     s=0.03, d=0.02, eta=0.40, kappa_v=0.30, kappa_e=5.0, cf=0.50,
     A=0.30, xi=0.50,
-    n_z=7, rho_z=0.90, sigma_z=0.20,
+    n_z=15,
+    use_pareto_z=true, alpha_z=1.35, z_min=0.40, fixed_z=false,
+    rho_z=0.90, sigma_z=0.20,
     n_ell=30, ell_max=40.0,
     n_a=80, a_min=0.0, a_max=50.0,
 )
-    z_grid, Pi_z, pi_z = tauchen(n_z, rho_z, sigma_z)
-    z_grid = exp.(z_grid)
+    z_grid, Pi_z, pi_z = make_ability_process(
+        n_z; use_pareto_z, alpha_z, z_min, fixed_z, rho_z, sigma_z)
     ell_grid = collect(range(0.0, ell_max, length=n_ell))   # start at 0 workers
     a_grid = a_min .+ (a_max - a_min) .* (range(0,1,length=n_a)).^2
     return Params(beta, sigma, b, alpha, nu, delta, lambda, r, s, d, eta,
                   kappa_v, kappa_e, cf, A, xi, n_z, z_grid, Pi_z, pi_z,
+                  use_pareto_z, alpha_z, z_min, fixed_z, rho_z, sigma_z,
                   n_ell, ell_grid, n_a, a_min, a_max, a_grid)
 end
 
-# ---- Tauchen ----
+# ---- Ability process: Pareto marginal + optional persistence ----
+#
+# Pareto type I on [z_min, inf):  F(z) = 1 - (z_min/z)^alpha_z.
+# Discretization: equal-probability bins on the existing n_z points.
+#   z_i = z_min / (1 - p_i)^(1/alpha_z),  p_i = (i - 0.5)/n_z  (mid-quantile).
+#   pi_z = uniform 1/n_z  (exact bin masses).
+# Approximation: each bin is summarized by one point (the mid-quantile), not the
+# conditional mean within the bin; negligible when n_z is moderate.
+#
+# Persistent (fixed_z=false): log z follows AR(1) with (rho_z, sigma_z), and
+# transitions are computed on the Pareto z_grid (Tauchen-style on log z).
+# The Markov chain's invariant pi_z is then iterated from Pi_z; it generally
+# DIFFERS slightly from the pure Pareto bin weights — honest caveat.
+#
+# Fixed for life (fixed_z=true): Pi_z = I; pi_z = Pareto bin weights; no z
+# expectations in VFI and no z updates in simulation.
+
+function discretize_pareto(n_z, alpha_z, z_min)
+    @assert alpha_z > 0.0 && z_min > 0.0
+    z_grid = [z_min / (1 - (i - 0.5)/n_z)^(1/alpha_z) for i in 1:n_z]
+    pi_z = fill(1/n_z, n_z)
+    return z_grid, pi_z
+end
+
+function log_ar1_transition(z_grid, rho, sigma)
+    n = length(z_grid)
+    logz = log.(z_grid)
+    Pi = zeros(n, n)
+    for i in 1:n
+        mu = rho * logz[i]
+        for j in 1:n
+            lo = j == 1 ? -Inf : (logz[j-1] + logz[j]) / 2
+            hi = j == n ? Inf  : (logz[j] + logz[j+1]) / 2
+            Pi[i,j] = ncdf((hi - mu)/sigma) - ncdf((lo - mu)/sigma)
+        end
+        s = sum(Pi[i,:])
+        s > 0.0 && (Pi[i,:] ./= s)
+    end
+    return Pi
+end
+
+function markov_stationary(Pi; max_iter=5000, tol=1e-12)
+    n = size(Pi, 1)
+    pi = fill(1/n, n)
+    for _ in 1:max_iter
+        pn = Pi' * pi
+        maximum(abs.(pn - pi)) < tol && return pn
+        pi = pn
+    end
+    return pi
+end
+
+function make_ability_process(n_z;
+    use_pareto_z=true, alpha_z=1.35, z_min=0.40, fixed_z=false,
+    rho_z=0.90, sigma_z=0.20)
+    if use_pareto_z
+        z_grid, pi_pareto = discretize_pareto(n_z, alpha_z, z_min)
+        if fixed_z
+            Pi_z = Matrix{Float64}(I, n_z, n_z)
+            pi_z = pi_pareto
+        else
+            Pi_z = log_ar1_transition(z_grid, rho_z, sigma_z)
+            pi_z = markov_stationary(Pi_z)
+        end
+    else
+        z_g, Pi_z, pi_z = tauchen(n_z, rho_z, sigma_z)
+        z_grid = exp.(z_g)
+        if fixed_z
+            Pi_z = Matrix{Float64}(I, n_z, n_z)
+        end
+    end
+    return z_grid, Pi_z, pi_z
+end
+
+# ---- Tauchen (legacy log-normal ability; used when use_pareto_z=false) ----
 function tauchen(n, rho, sigma; m=3.0)
     su = sigma/sqrt(1-rho^2)
     zg = collect(range(-m*su, m*su, length=n)); dz = zg[2]-zg[1]
@@ -235,8 +327,12 @@ function solve_firm_vfi(theta, p; tol=1e-8, max_iter=2000)
         En = similar(E)
         for iz in 1:p.n_z
             z = p.z_grid[iz]
-            Eexp = zeros(p.n_ell)
-            for iz2 in 1:p.n_z; Eexp .+= p.Pi_z[iz,iz2].*E[iz2,:]; end
+            if p.fixed_z
+                Eexp = E[iz,:]
+            else
+                Eexp = zeros(p.n_ell)
+                for iz2 in 1:p.n_z; Eexp .+= p.Pi_z[iz,iz2].*E[iz2,:]; end
+            end
             for il in 1:p.n_ell
                 ell=p.ell_grid[il]; w=wage_sched(z,ell,theta,p)
                 pif = pi_firm_unc(z,ell,w,p)   # unconstrained k* (labor block)
@@ -392,24 +488,31 @@ function solve_household(theta, E_firm, v_pol, p;
         Vun=copy(Vu); Vwn=copy(Vw); Vwsn=copy(Vw_stay)
         Ven=copy(Ve); Ve_opn=copy(Ve_op)
         for iz in 1:nz
-            # z-expectations of the (a,z) value functions
-            EVu=zeros(na); EVw=zeros(na)
-            for iz2 in 1:nz
-                EVu .+= p.Pi_z[iz,iz2].*Vu[:,iz2]
-                EVw .+= p.Pi_z[iz,iz2].*Vw[:,iz2]
+            # z-expectations of the (a,z) value functions (skip when z is fixed for life)
+            if p.fixed_z
+                EVu = Vu[:,iz]
+                EVw = Vw[:,iz]
+            else
+                EVu=zeros(na); EVw=zeros(na)
+                for iz2 in 1:nz
+                    EVu .+= p.Pi_z[iz,iz2].*Vu[:,iz2]
+                    EVw .+= p.Pi_z[iz,iz2].*Vw[:,iz2]
+                end
             end
 
             # ---- ENTREPRENEUR: operate value Ve_op(a,z,ell) over the ell grid
             for iel in 1:n_ell_e
                 ellp = ellp_e[iz,iel]
-                # E[ Ve(a', z', ell') ] over z', evaluated at the (deterministic)
-                # next firm size ell' -> a vector over a'. ell' is fixed given
-                # (z,ell), so interpolate the ell-dimension of Ve once here.
-                EVe_ellp=zeros(na)
-                for iz2 in 1:nz
-                    w2=p.Pi_z[iz,iz2]; w2==0.0 && continue
-                    @inbounds for ia in 1:na
-                        EVe_ellp[ia] += w2*interp_ell(ell_grid_e, view(Ve,ia,iz2,:), ellp)
+                # E[ Ve(a', z', ell') ] over z' (degenerate when fixed_z)
+                if p.fixed_z
+                    EVe_ellp = [interp_ell(ell_grid_e, view(Ve, ia, iz, :), ellp) for ia in 1:na]
+                else
+                    EVe_ellp=zeros(na)
+                    for iz2 in 1:nz
+                        w2=p.Pi_z[iz,iz2]; w2==0.0 && continue
+                        @inbounds for ia in 1:na
+                            EVe_ellp[ia] += w2*interp_ell(ell_grid_e, view(Ve,ia,iz2,:), ellp)
+                        end
                     end
                 end
                 contE(ap)=(1-p.d)*interp_a(EVe_ellp,p,ap)+p.d*interp_a(EVu,p,ap)
@@ -576,8 +679,10 @@ function simulate_population(theta, hh, p; N=20000, T=600, burn=300, seed=1)
                     state[i]=3; ell[i]=ellnew
                 end
             end
-            # ability shock
-            r=rand(rng); z[i]=searchsortedfirst(cum[iz,:], r)
+            # ability shock (persistent z only; fixed_z draws z once at initialization)
+            if !p.fixed_z
+                r=rand(rng); z[i]=searchsortedfirst(cum[iz,:], r)
+            end
         end
         if t>burn
             share_u += count(==(1),state)/N
@@ -615,6 +720,9 @@ end
 
 function solve_model(p)
     println("="^64); println("MERGED MODEL: DMP + BHA + Occupational Choice"); println("="^64)
+    ztag = p.fixed_z ? "fixed for life" : "persistent"
+    ptag = p.use_pareto_z ? @sprintf("Pareto alpha_z=%.2f", p.alpha_z) : "Tauchen/log-normal"
+    println(@sprintf("  Ability: %s (%s)", ptag, ztag))
     theta, E_firm, v_pol = solve_labor_market(p)
     println("\n[2/2] Household block with occupational choice ...")
     hh = solve_household(theta, E_firm, v_pol, p; verbose=true)
